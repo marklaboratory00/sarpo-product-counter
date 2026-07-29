@@ -34,7 +34,7 @@ TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
-BRANCHES = ["Sarpo Sergeli", "Sarpo Yunusobod", "Sarpo General"]
+BRANCHES = ["Basic Sergeli", "Basic HighTownMall", "Basic ParkinMall", "Basic General"]
 SIZES = ["XL", "L", "M", "S", "XS"]
 
 
