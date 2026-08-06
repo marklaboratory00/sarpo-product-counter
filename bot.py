@@ -61,7 +61,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS counts (
             branch TEXT,
             product_id INTEGER,
-            xl INTEGER, l INTEGER, m INTEGER, s INTEGER, xs INTEGER,
+            xl INTEGER, l INTEGER, m INTEGER, s INTEGER,
             user_id INTEGER,
             username TEXT,
             updated_at TEXT,
@@ -141,10 +141,10 @@ def branch_last_user(branch):
 def save_count(branch, product_id, nums, user_id, username):
     conn = db()
     conn.execute(
-        """INSERT INTO counts(branch, product_id, xl,l,m,s,xs, user_id, username, updated_at)
+        """INSERT INTO counts(branch, product_id, xl,l,m,s, user_id, username, updated_at)
            VALUES(?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(branch, product_id) DO UPDATE SET
-             xl=excluded.xl, l=excluded.l, m=excluded.m, s=excluded.s, xs=excluded.xs,
+             xl=excluded.xl, l=excluded.l, m=excluded.m, s=excluded.s,
              user_id=excluded.user_id, username=excluded.username, updated_at=excluded.updated_at""",
         (branch, product_id, *nums, user_id, username,
          datetime.now().isoformat(timespec="seconds")),
@@ -271,14 +271,14 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wb = Workbook()
     ws = wb.active
     ws.title = "Qoldiqlar"
-    headers = ["Filial", "Artikul", "Nomi", "XL", "L", "M", "S", "XS", "Sana"]
+    headers = ["Filial", "Artikul", "Nomi", "XL", "L", "M", "S", "Sana"]
     ws.append(headers)
     for c in ws[1]:
         c.font = Font(bold=True)
 
     conn = db()
     rows = conn.execute(
-        """SELECT c.branch, p.article, p.name, c.xl, c.l, c.m, c.s, c.xs, c.updated_at
+        """SELECT c.branch, p.article, p.name, c.xl, c.l, c.m, c.s, c.updated_at
            FROM counts c JOIN products p ON p.id = c.product_id
            ORDER BY c.branch, p.position"""
     ).fetchall()
@@ -286,7 +286,7 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for r in rows:
         ws.append([r["branch"], r["article"], r["name"],
-                   r["xl"], r["l"], r["m"], r["s"], r["xs"], r["updated_at"]])
+                   r["xl"], r["l"], r["m"], r["s"], r["updated_at"]])
 
     widths = [16, 10, 28, 5, 5, 5, 5, 5, 20]
     for i, w in enumerate(widths, start=1):
@@ -349,7 +349,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = text.split()
     if len(parts) != 5 or not all(x.isdigit() for x in parts):
         await update.message.reply_text(
-            f"5 ta son kerak, tartib bilan: {' '.join(SIZES)}. Masalan: 2 3 1 0 4"
+            f"5 ta son kerak, tartib bilan: {' '.join(SIZES)}. Masalan: 2 3 1 0"
         )
         return
     nums = [int(x) for x in parts]
@@ -376,7 +376,7 @@ async def handle_save(update: Update, context: ContextTypes.DEFAULT_TYPE, zeros:
         await query.edit_message_text("Bu filial allaqachon yakunlangan.")
         return
     if zeros:
-        nums = [0, 0, 0, 0, 0]
+        nums = [0, 0, 0, 0]
     else:
         nums = context.user_data.get("pending")
         if nums is None:
@@ -416,7 +416,7 @@ async def notify_admin_item(context, branch, product, nums, who, num, total):
     txt = (
         f"📝 {branch} · {who}\n"
         f"{product['article']} {product['name']}  ({num}/{total})\n"
-        f"XL:{xl}  L:{l}  M:{m}  S:{s_}  XS:{xs}"
+        f"XL:{xl}  L:{l}  M:{m}  S:{s_}"
     )
     try:
         await context.bot.send_message(ADMIN_ID, txt)
