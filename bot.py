@@ -35,7 +35,7 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
 BRANCHES = ["Sarpo Sergeli", "Sarpo Yunusobod", "Sarpo General"]
-SIZES = ["XL", "L", "M", "S", "XS"]
+SIZES = ["XL", "L", "M", "S"]
 
 
 # =========================================================
