@@ -1,41 +1,48 @@
 import os
 import io
+import re
 import sqlite3
 import logging
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputFile,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters,
 )
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO)
 log = logging.getLogger("sarpo-bot")
 
-# ---- settings from environment ----
+# ---- settings ----
 TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
-DB_PATH = os.environ.get("DB_PATH", "bot.db")
+DB_PATH = os.environ.get("DB_PATH", "bot.db")          # Railway'da /data/bot.db bo'lsin (Volume!)
+IMPORT_PATH = os.path.join(os.path.dirname(DB_PATH) or ".", "import.xlsx")
 
-BRANCHES = ["Basic Sergeli", "Basic HighTownMall", "Basic ParkinMall", "Basic GeneralUzakov"]
-SIZES = ["XL", "L", "M", "S", "XS"]
+SIZES = ["XL", "L", "M", "S"]
+
+# Filial -> qaysi brendlarni sotadi
+BRANCH_BRANDS = {
+    "Yunusobod":      ["Sarpo"],
+    "High Town Mall": ["Basic"],
+    "Park in Mall":   ["Basic"],
+    "General Uzakov": ["Basic", "Sarpo"],
+    "Sergeli":        ["Basic", "Sarpo"],
+}
+BRANCHES = list(BRANCH_BRANDS.keys())
+
+# Import faylida (xlsx) har brend varag'idagi filial ustunlari tartibi
+BRAND_BRANCHCOLS = {
+    "Basic": ["High Town Mall", "Park in Mall", "General Uzakov", "Sergeli"],
+    "Sarpo": ["Yunusobod", "General Uzakov", "Sergeli"],
+}
+STOCK_START_COL = 9   # I ustun
+ART_COL, NAME_COL, IMG_COL = 7, 5, 1
 
 
 # =========================================================
@@ -53,24 +60,17 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            position INTEGER,
-            article TEXT,
-            name TEXT,
-            file_id TEXT
+            position INTEGER, article TEXT, name TEXT, brand TEXT, file_id TEXT
         );
         CREATE TABLE IF NOT EXISTS counts (
-            branch TEXT,
-            product_id INTEGER,
-            xl INTEGER, l INTEGER, m INTEGER, s INTEGER, xs INTEGER,
-            user_id INTEGER,
-            username TEXT,
-            updated_at TEXT,
+            branch TEXT, product_id INTEGER,
+            xl INTEGER, l INTEGER, m INTEGER, s INTEGER,
+            reviewed INTEGER DEFAULT 0,
+            user_id INTEGER, username TEXT, updated_at TEXT,
             PRIMARY KEY (branch, product_id)
         );
         CREATE TABLE IF NOT EXISTS sessions (
-            user_id INTEGER PRIMARY KEY,
-            branch TEXT,
-            idx INTEGER
+            user_id INTEGER PRIMARY KEY, branch TEXT, idx INTEGER
         );
         """
     )
@@ -78,9 +78,17 @@ def init_db():
     conn.close()
 
 
-def products_all():
+def brand_brands(branch):
+    return BRANCH_BRANDS.get(branch, [])
+
+
+def products_for_branch(branch):
+    brands = brand_brands(branch)
+    if not brands:
+        return []
     conn = db()
-    rows = conn.execute("SELECT * FROM products ORDER BY position").fetchall()
+    q = "SELECT * FROM products WHERE brand IN (%s) ORDER BY position" % ",".join("?" * len(brands))
+    rows = conn.execute(q, brands).fetchall()
     conn.close()
     return rows
 
@@ -92,65 +100,41 @@ def products_count():
     return n
 
 
-def add_product(article, name, file_id):
+def set_file_id(product_id, file_id):
     conn = db()
-    pos = conn.execute("SELECT COALESCE(MAX(position),0) m FROM products").fetchone()["m"] + 1
-    conn.execute(
-        "INSERT INTO products(position, article, name, file_id) VALUES (?,?,?,?)",
-        (pos, article, name, file_id),
-    )
+    conn.execute("UPDATE products SET file_id=? WHERE id=?", (file_id, product_id))
     conn.commit()
     conn.close()
-    return pos
 
 
-def delete_last_product():
+def get_count(branch, product_id):
     conn = db()
-    row = conn.execute("SELECT id, article FROM products ORDER BY position DESC LIMIT 1").fetchone()
-    if row:
-        conn.execute("DELETE FROM products WHERE id=?", (row["id"],))
-        conn.commit()
+    row = conn.execute("SELECT * FROM counts WHERE branch=? AND product_id=?", (branch, product_id)).fetchone()
     conn.close()
     return row
 
 
-def clear_products():
-    conn = db()
-    conn.execute("DELETE FROM products")
-    conn.commit()
-    conn.close()
-
-
-def branch_counted(branch):
-    conn = db()
-    n = conn.execute("SELECT COUNT(*) c FROM counts WHERE branch=?", (branch,)).fetchone()["c"]
-    conn.close()
-    return n
-
-
-def branch_last_user(branch):
-    conn = db()
-    row = conn.execute(
-        "SELECT username FROM counts WHERE branch=? ORDER BY updated_at DESC LIMIT 1",
-        (branch,),
-    ).fetchone()
-    conn.close()
-    return row["username"] if row else None
-
-
-def save_count(branch, product_id, nums, user_id, username):
+def save_count(branch, product_id, nums, reviewed, user_id, username):
     conn = db()
     conn.execute(
-        """INSERT INTO counts(branch, product_id, xl,l,m,s,xs, user_id, username, updated_at)
+        """INSERT INTO counts(branch,product_id,xl,l,m,s,reviewed,user_id,username,updated_at)
            VALUES(?,?,?,?,?,?,?,?,?,?)
-           ON CONFLICT(branch, product_id) DO UPDATE SET
-             xl=excluded.xl, l=excluded.l, m=excluded.m, s=excluded.s, xs=excluded.xs,
-             user_id=excluded.user_id, username=excluded.username, updated_at=excluded.updated_at""",
-        (branch, product_id, *nums, user_id, username,
-         datetime.now().isoformat(timespec="seconds")),
+           ON CONFLICT(branch,product_id) DO UPDATE SET
+             xl=excluded.xl,l=excluded.l,m=excluded.m,s=excluded.s,
+             reviewed=excluded.reviewed,user_id=excluded.user_id,
+             username=excluded.username,updated_at=excluded.updated_at""",
+        (branch, product_id, nums[0], nums[1], nums[2], nums[3], reviewed,
+         user_id, username, datetime.now().isoformat(timespec="seconds")),
     )
     conn.commit()
     conn.close()
+
+
+def reviewed_count(branch):
+    conn = db()
+    n = conn.execute("SELECT COUNT(*) c FROM counts WHERE branch=? AND reviewed=1", (branch,)).fetchone()["c"]
+    conn.close()
+    return n
 
 
 def get_session(user_id):
@@ -163,7 +147,7 @@ def get_session(user_id):
 def set_session(user_id, branch, idx):
     conn = db()
     conn.execute(
-        """INSERT INTO sessions(user_id, branch, idx) VALUES(?,?,?)
+        """INSERT INTO sessions(user_id,branch,idx) VALUES(?,?,?)
            ON CONFLICT(user_id) DO UPDATE SET branch=excluded.branch, idx=excluded.idx""",
         (user_id, branch, idx),
     )
@@ -184,85 +168,136 @@ def who_label(user):
 
 
 # =========================================================
-#  ADMIN: katalog yuklash
+#  IMPORT (xlsx -> baza)
+# =========================================================
+def do_import():
+    wb = load_workbook(IMPORT_PATH)
+    conn = db()
+    pos = conn.execute("SELECT COALESCE(MAX(position),0) m FROM products").fetchone()["m"]
+    added = updated = counts_added = 0
+    for ws in wb.worksheets:
+        brand = ws.title.strip()
+        if brand not in BRAND_BRANCHCOLS:
+            continue
+        branches = BRAND_BRANCHCOLS[brand]
+        for r in range(2, ws.max_row + 1):
+            art = ws.cell(r, ART_COL).value
+            if art in (None, ""):
+                continue
+            art = str(int(art)) if isinstance(art, (int, float)) else str(art).strip()
+            name = ws.cell(r, NAME_COL).value or ""
+            imgf = ws.cell(r, IMG_COL).value
+            url = ""
+            if isinstance(imgf, str):
+                mm = re.search(r'https://[^"]+', imgf)
+                if mm:
+                    url = mm.group(0)
+            row_ex = conn.execute("SELECT id FROM products WHERE article=? AND brand=?", (art, brand)).fetchone()
+            if row_ex:
+                pid = row_ex["id"]
+                conn.execute("UPDATE products SET name=?, file_id=? WHERE id=?", (name, url, pid))
+                updated += 1
+            else:
+                pos += 1
+                cur = conn.execute(
+                    "INSERT INTO products(position,article,name,brand,file_id) VALUES(?,?,?,?,?)",
+                    (pos, art, name, brand, url),
+                )
+                pid = cur.lastrowid
+                added += 1
+            for bi, br in enumerate(branches):
+                base = STOCK_START_COL + bi * 4
+                vals = [ws.cell(r, base + si).value for si in range(4)]
+                if all(v in (None, "") for v in vals):
+                    continue
+                nums = [int(v) if isinstance(v, (int, float)) else 0 for v in vals]
+                conn.execute(
+                    """INSERT INTO counts(branch,product_id,xl,l,m,s,reviewed,user_id,username,updated_at)
+                       VALUES(?,?,?,?,?,?,0,0,'import',?)
+                       ON CONFLICT(branch,product_id) DO UPDATE SET
+                         xl=excluded.xl,l=excluded.l,m=excluded.m,s=excluded.s""",
+                    (br, pid, nums[0], nums[1], nums[2], nums[3],
+                     datetime.now().isoformat(timespec="seconds")),
+                )
+                counts_added += 1
+    conn.commit()
+    conn.close()
+    return added, updated, counts_added
+
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    doc = update.message.document
+    if not doc or not doc.file_name.lower().endswith((".xlsx", ".xls")):
+        await update.message.reply_text("Excel (.xlsx) fayl yuboring.")
+        return
+    f = await doc.get_file()
+    await f.download_to_drive(IMPORT_PATH)
+    await update.message.reply_text("📥 Fayl qabul qilindi. Import uchun /import bosing.")
+
+
+async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not os.path.exists(IMPORT_PATH):
+        await update.message.reply_text("Avval Excel faylni yuboring, keyin /import.")
+        return
+    await update.message.reply_text("⏳ Import boshlandi…")
+    try:
+        added, updated, counts_added = do_import()
+        await update.message.reply_text(
+            f"✅ Import tayyor.\nYangi mahsulot: {added}\nYangilangan: {updated}\n"
+            f"Qoldiq yozuvlari: {counts_added}\n\nEndi xodimlar /start bilan tekshirishi mumkin."
+        )
+    except Exception as e:
+        log.exception("import error")
+        await update.message.reply_text(f"❌ Import xatosi: {e}")
+
+
+# =========================================================
+#  ADMIN buyruqlari
 # =========================================================
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # yangi mahsulotni qo'lda qo'shish: rasm + "artikul brend nomi"
     user = update.effective_user
     if user.id != ADMIN_ID:
-        await update.message.reply_text("Mahsulot yuklash faqat administrator uchun.")
+        await update.message.reply_text("Faqat administrator uchun.")
         return
-    caption = update.message.caption
-    if not caption or not caption.strip():
-        await update.message.reply_text(
-            "Rasmga izoh qo'shing — artikul va nomi. Masalan:\n22101 Anor gullari - oq rang"
-        )
+    cap = (update.message.caption or "").strip()
+    if not cap:
+        await update.message.reply_text("Izoh: artikul brend nomi. Masalan:\n22400 Sarpo Anor gullari - oq")
         return
+    parts = cap.split(None, 2)
+    art = parts[0]
+    brand = parts[1] if len(parts) > 1 and parts[1] in BRAND_BRANCHCOLS else "Sarpo"
+    name = parts[2].strip() if len(parts) > 2 else (parts[1] if len(parts) > 1 else "")
     file_id = update.message.photo[-1].file_id
-    parts = caption.strip().split(None, 1)          # birinchi so'z = artikul, qolgani = nomi
-    article = parts[0]
-    name = parts[1].strip() if len(parts) > 1 else ""
-    pos = add_product(article, name, file_id)
-    await update.message.reply_text(f"✅ {pos}-mahsulot qo'shildi: {article} — {name}")
-
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    prods = products_all()
-    if not prods:
-        await update.message.reply_text("Katalog bo'sh.")
-        return
-    tail = prods[-30:]
-    lines = [f"{p['position']}. {p['article']} — {p['name']}" for p in tail]
-    head = f"Jami mahsulotlar: {len(prods)} (oxirgi {len(tail)} tasi)\n"
-    await update.message.reply_text(head + "\n".join(lines))
-
-
-async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    row = delete_last_product()
-    if row:
-        await update.message.reply_text(f"Oxirgi mahsulot o'chirildi: {row['article']}")
-    else:
-        await update.message.reply_text("O'chiradigan narsa yo'q.")
-
-
-async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚠️ Ha, butun katalogni o'chirish", callback_data="clearcat")]])
-    await update.message.reply_text("Butun mahsulotlar katalogi o'chirilsinmi?", reply_markup=kb)
-
-
-async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    n = products_count()
-    await update.message.reply_text(f"Katalog tayyor: {n} ta mahsulot. Xodimlar boshlashi mumkin: /start")
+    conn = db()
+    pos = conn.execute("SELECT COALESCE(MAX(position),0) m FROM products").fetchone()["m"] + 1
+    conn.execute("INSERT INTO products(position,article,name,brand,file_id) VALUES(?,?,?,?,?)",
+                 (pos, art, name, brand, file_id))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"✅ Qo'shildi: {art} · {brand} · {name}")
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    total = products_count()
     lines = []
     for b in BRANCHES:
-        done = branch_counted(b)
-        who = branch_last_user(b)
-        who_txt = f"  @{who}" if (done and who) else ""
-        lines.append(f"{b}: {done}/{total}{who_txt}")
-    await update.message.reply_text("Hisob holati:\n" + "\n".join(lines))
+        total = len(products_for_branch(b))
+        done = reviewed_count(b)
+        lines.append(f"{b}: {done}/{total}")
+    await update.message.reply_text("Tekshirilgan holat:\n" + "\n".join(lines))
 
 
 async def cmd_newcount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Ha, yangi hisobni boshlash", callback_data="newcount")]])
-    await update.message.reply_text(
-        "Barcha qoldiqlar nollanadi va yangi hisob boshlanadi. Mahsulotlar katalogi qoladi. Davom etamizmi?",
-        reply_markup=kb,
-    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Ha, yangi hisob", callback_data="newcount")]])
+    await update.message.reply_text("Barcha qoldiqlar nollanadi (katalog qoladi). Davom etamizmi?", reply_markup=kb)
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,42 +306,35 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wb = Workbook()
     ws = wb.active
     ws.title = "Qoldiqlar"
-    headers = ["Filial", "Artikul", "Nomi", "XL", "L", "M", "S", "XS", "Sana"]
-    ws.append(headers)
+    ws.append(["Filial", "Brend", "Artikul", "Nomi", "XL", "L", "M", "S", "Tekshirilgan", "Sana"])
     for c in ws[1]:
         c.font = Font(bold=True)
-
     conn = db()
     rows = conn.execute(
-        """SELECT c.branch, p.article, p.name, c.xl, c.l, c.m, c.s, c.xs, c.updated_at
-           FROM counts c JOIN products p ON p.id = c.product_id
+        """SELECT c.branch, p.brand, p.article, p.name, c.xl,c.l,c.m,c.s, c.reviewed, c.updated_at
+           FROM counts c JOIN products p ON p.id=c.product_id
            ORDER BY c.branch, p.position"""
     ).fetchall()
     conn.close()
-
     for r in rows:
-        ws.append([r["branch"], r["article"], r["name"],
-                   r["xl"], r["l"], r["m"], r["s"], r["xs"], r["updated_at"]])
-
-    widths = [16, 10, 28, 5, 5, 5, 5, 5, 20]
-    for i, w in enumerate(widths, start=1):
+        ws.append([r["branch"], r["brand"], r["article"], r["name"],
+                   r["xl"], r["l"], r["m"], r["s"],
+                   "ha" if r["reviewed"] else "yo'q", r["updated_at"]])
+    for i, w in enumerate([16, 8, 10, 26, 5, 5, 5, 5, 12, 20], start=1):
         ws.column_dimensions[chr(64 + i)].width = w
-
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
-    fname = f"sarpo_qoldiqlar_{datetime.now():%Y-%m-%d}.xlsx"
-    await update.message.reply_document(document=InputFile(bio, filename=fname))
-    if not rows:
-        await update.message.reply_text("Hozircha birorta ham to'ldirilgan mahsulot yo'q — fayl bo'sh.")
+    await update.message.reply_document(
+        document=InputFile(bio, filename=f"qoldiqlar_{datetime.now():%Y-%m-%d}.xlsx"))
 
 
 # =========================================================
-#  XODIM: sanash jarayoni
+#  XODIM: tekshirish jarayoni
 # =========================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if products_count() == 0:
-        await update.message.reply_text("Katalog hali bo'sh. Administrator mahsulotlarni yuklashini kuting.")
+        await update.message.reply_text("Katalog bo'sh. Administrator import qilishini kuting.")
         return
     kb = [[InlineKeyboardButton(b, callback_data=f"b:{i}")] for i, b in enumerate(BRANCHES)]
     await update.message.reply_text("Filialni tanlang:", reply_markup=InlineKeyboardMarkup(kb))
@@ -316,124 +344,79 @@ async def send_product(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     s = get_session(user_id)
     if not s:
         return
-    prods = products_all()
+    branch = s["branch"]
+    prods = products_for_branch(branch)
     total = len(prods)
     idx = s["idx"]
     if idx >= total:
-        branch = s["branch"]
-        await context.bot.send_message(
-            user_id, f"✅ Tayyor! {branch}: {total} tadan {total} tasi sanaldi. Rahmat!"
-        )
-        await notify_admin_done(context, branch)
+        await context.bot.send_message(user_id, f"✅ Tayyor! {branch}: {total} tadan {total} tasi tekshirildi. Rahmat!")
+        try:
+            await context.bot.send_message(ADMIN_ID, f"✅ {branch} — tekshiruv yakunlandi ({total} ta).")
+        except Exception:
+            pass
         return
     p = prods[idx]
-    caption = (
-        f"{p['article']} · {p['name']}\n"
-        f"Mahsulot {idx + 1} / {total}\n\n"
-        f"Qoldiqni tartib bilan yozing: {' '.join(SIZES)}\n"
-        f"Masalan: 2 3 1 0 4"
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("∅ Qoldiq yo'q", callback_data="zero")],
-        [InlineKeyboardButton("← Orqaga", callback_data="back")],
-    ])
-    await context.bot.send_photo(user_id, photo=p["file_id"], caption=caption, reply_markup=kb)
+    ex = get_count(branch, p["id"])
+    head = f"{p['article']} · {p['brand']} · {p['name']}\nMahsulot {idx+1} / {total}"
+    if ex:
+        cur = f"XL:{ex['xl']}  L:{ex['l']}  M:{ex['m']}  S:{ex['s']}"
+        caption = f"{head}\n\nHozirgi qoldiq: {cur}\nTo'g'ri bo'lsa — ✅. Aks holda yangi 4 ta son yozing: {' '.join(SIZES)}"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ To'g'ri (keyingisi)", callback_data="ok")],
+            [InlineKeyboardButton("← Orqaga", callback_data="back")],
+        ])
+    else:
+        caption = f"{head}\n\nQoldiqni yozing: {' '.join(SIZES)}\nMasalan: 2 3 1 0"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("∅ Qoldiq yo'q", callback_data="zero")],
+            [InlineKeyboardButton("← Orqaga", callback_data="back")],
+        ])
+    photo = p["file_id"]
+    try:
+        msg = await context.bot.send_photo(user_id, photo=photo, caption=caption, reply_markup=kb)
+        # URL bo'lsa -> Telegram file_id ni saqlab qo'yamiz (keyin Drive kerak bo'lmaydi)
+        if isinstance(photo, str) and photo.startswith("http") and msg.photo:
+            set_file_id(p["id"], msg.photo[-1].file_id)
+    except Exception as e:
+        log.warning("send_photo failed (%s): %s", p["article"], e)
+        await context.bot.send_message(user_id, caption + "\n\n(rasm yuklanmadi)", reply_markup=kb)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     s = get_session(user.id)
     if not s:
-        return  # foydalanuvchi sanash rejimida emas — e'tiborsiz qoldiramiz
-    text = update.message.text.replace(",", " ")
-    parts = text.split()
-    if len(parts) != 5 or not all(x.isdigit() for x in parts):
-        await update.message.reply_text(
-            f"5 ta son kerak, tartib bilan: {' '.join(SIZES)}. Masalan: 2 3 1 0 4"
-        )
+        return
+    parts = update.message.text.replace(",", " ").split()
+    if len(parts) != 4 or not all(x.isdigit() for x in parts):
+        await update.message.reply_text(f"4 ta son kerak: {' '.join(SIZES)}. Masalan: 2 3 1 0")
         return
     nums = [int(x) for x in parts]
     context.user_data["pending"] = nums
-    summary = " · ".join(f"{sz}: {n}" for sz, n in zip(SIZES, nums))
+    summary = " · ".join(f"{sz}:{n}" for sz, n in zip(SIZES, nums))
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Saqlash va keyingisi", callback_data="save"),
+        InlineKeyboardButton("✅ Saqlash", callback_data="save"),
         InlineKeyboardButton("✏️ Qaytadan", callback_data="redo"),
     ]])
     await update.message.reply_text(summary, reply_markup=kb)
 
 
-async def handle_save(update: Update, context: ContextTypes.DEFAULT_TYPE, zeros: bool):
-    query = update.callback_query
-    user = query.from_user
+async def advance(context, user, nums=None, accept=False):
     s = get_session(user.id)
     if not s:
-        await query.edit_message_text("Sessiya topilmadi, /start ni bosing.")
         return
-    prods = products_all()
-    total = len(prods)
+    branch = s["branch"]
+    prods = products_for_branch(branch)
     idx = s["idx"]
-    if idx >= total:
-        await query.edit_message_text("Bu filial allaqachon yakunlangan.")
+    if idx >= len(prods):
         return
-    if zeros:
-        nums = [0, 0, 0, 0, 0]
-    else:
-        nums = context.user_data.get("pending")
-        if nums is None:
-            await query.edit_message_text("Avval 5 ta son kiriting.")
-            return
     p = prods[idx]
-    save_count(s["branch"], p["id"], nums, user.id, user.username or user.full_name)
-    context.user_data.pop("pending", None)
-    set_session(user.id, s["branch"], idx + 1)
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    # administratorga har bir mahsulot bo'yicha xabar
-    await notify_admin_item(context, s["branch"], p, nums, who_label(user), idx + 1, total)
+    if accept:
+        ex = get_count(branch, p["id"])
+        nums = [ex["xl"], ex["l"], ex["m"], ex["s"]] if ex else [0, 0, 0, 0]
+    save_count(branch, p["id"], nums, 1, user.id, user.username or user.full_name)
+    set_session(user.id, branch, idx + 1)
     await send_product(context, user.id)
-
-
-async def handle_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user = query.from_user
-    s = get_session(user.id)
-    if not s:
-        return
-    idx = max(0, s["idx"] - 1)
-    set_session(user.id, s["branch"], idx)
-    context.user_data.pop("pending", None)
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await send_product(context, user.id)
-
-
-async def notify_admin_item(context, branch, product, nums, who, num, total):
-    xl, l, m, s_, xs = nums
-    txt = (
-        f"📝 {branch} · {who}\n"
-        f"{product['article']} {product['name']}  ({num}/{total})\n"
-        f"XL:{xl}  L:{l}  M:{m}  S:{s_}  XS:{xs}"
-    )
-    try:
-        await context.bot.send_message(ADMIN_ID, txt)
-    except Exception as e:
-        log.warning("cannot notify admin item: %s", e)
-
-
-async def notify_admin_done(context: ContextTypes.DEFAULT_TYPE, branch: str):
-    total = products_count()
-    who = branch_last_user(branch)
-    who_txt = f"@{who}" if who else "xodim"
-    try:
-        await context.bot.send_message(
-            ADMIN_ID, f"✅ {branch} tayyor — {total} ta mahsulot, sanadi {who_txt}."
-        )
-    except Exception as e:
-        log.warning("cannot notify admin: %s", e)
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -443,20 +426,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if data.startswith("b:"):
-        idx_b = int(data.split(":")[1])
-        branch = BRANCHES[idx_b]
-        total = products_count()
-        done = branch_counted(branch)
-        if total > 0 and done >= total:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Qaytadan sanash", callback_data=f"restart:{idx_b}")]])
-            await query.edit_message_text(f"{branch} allaqachon yakunlangan: {total} / {total}.", reply_markup=kb)
+        branch = BRANCHES[int(data.split(":")[1])]
+        total = len(products_for_branch(branch))
+        done = reviewed_count(branch)
+        if total and done >= total:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Qaytadan", callback_data=f"restart:{BRANCHES.index(branch)}")]])
+            await query.edit_message_text(f"{branch}: {total}/{total} tekshirilgan.", reply_markup=kb)
             return
         if 0 < done < total:
+            i = BRANCHES.index(branch)
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"▶️ Davom etish ({done + 1}-dan)", callback_data=f"cont:{idx_b}")],
-                [InlineKeyboardButton("🔄 Boshidan boshlash", callback_data=f"restart:{idx_b}")],
+                [InlineKeyboardButton(f"▶️ Davom ({done+1}-dan)", callback_data=f"cont:{i}")],
+                [InlineKeyboardButton("🔄 Boshidan", callback_data=f"restart:{i}")],
             ])
-            await query.edit_message_text(f"{branch}: {done} / {total} sanalgan.", reply_markup=kb)
+            await query.edit_message_text(f"{branch}: {done}/{total} tekshirilgan.", reply_markup=kb)
             return
         set_session(user.id, branch, 0)
         await query.edit_message_text(f"Filial: {branch}")
@@ -464,84 +447,73 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("cont:"):
-        idx_b = int(data.split(":")[1])
-        branch = BRANCHES[idx_b]
-        set_session(user.id, branch, branch_counted(branch))
-        await query.edit_message_text(f"Davom etamiz: {branch}")
+        branch = BRANCHES[int(data.split(":")[1])]
+        set_session(user.id, branch, reviewed_count(branch))
+        await query.edit_message_text(f"Davom: {branch}")
         await send_product(context, user.id)
         return
-
     if data.startswith("restart:"):
-        idx_b = int(data.split(":")[1])
-        branch = BRANCHES[idx_b]
+        branch = BRANCHES[int(data.split(":")[1])]
         set_session(user.id, branch, 0)
-        await query.edit_message_text(f"Boshidan boshlaymiz: {branch}")
+        await query.edit_message_text(f"Boshidan: {branch}")
         await send_product(context, user.id)
         return
 
-    if data == "zero":
-        await handle_save(update, context, zeros=True)
-        return
-    if data == "save":
-        await handle_save(update, context, zeros=False)
-        return
-    if data == "redo":
-        context.user_data.pop("pending", None)
-        await query.edit_message_text("Mayli, 5 ta sonni qaytadan kiriting: " + " ".join(SIZES))
-        return
-    if data == "back":
-        await handle_back(update, context)
-        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
-    if data == "clearcat":
-        if user.id != ADMIN_ID:
+    if data == "ok":
+        await advance(context, user, accept=True)
+    elif data == "zero":
+        await advance(context, user, nums=[0, 0, 0, 0])
+    elif data == "save":
+        nums = context.user_data.pop("pending", None)
+        if nums is None:
+            await context.bot.send_message(user.id, "Avval 4 ta son kiriting.")
             return
-        clear_products()
-        await query.edit_message_text("Katalog tozalandi.")
-        return
-    if data == "newcount":
-        if user.id != ADMIN_ID:
-            return
-        clear_counts()
-        await query.edit_message_text("Yangi hisob boshlandi. Qoldiqlar nollandi, katalog joyida.")
-        return
+        await advance(context, user, nums=nums)
+    elif data == "redo":
+        context.user_data.pop("pending", None)
+        await context.bot.send_message(user.id, "Qaytadan 4 ta son yozing: " + " ".join(SIZES))
+    elif data == "back":
+        s = get_session(user.id)
+        if s:
+            set_session(user.id, s["branch"], max(0, s["idx"] - 1))
+            await send_product(context, user.id)
+    elif data == "newcount":
+        if user.id == ADMIN_ID:
+            clear_counts()
+            await context.bot.send_message(user.id, "Yangi hisob boshlandi. Qoldiqlar nollandi.")
 
 
 # =========================================================
-#  Health server (Railway uchun) + startup
+#  Health server + startup
 # =========================================================
 class Health(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-    def log_message(self, *args):
-        pass
+        self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+    def log_message(self, *a): pass
 
 
 def run_health():
-    port = int(os.environ.get("PORT", "8080"))
-    HTTPServer(("0.0.0.0", port), Health).serve_forever()
+    HTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Health).serve_forever()
 
 
 def main():
     init_db()
     threading.Thread(target=run_health, daemon=True).start()
-
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("undo", cmd_undo))
-    app.add_handler(CommandHandler("clear", cmd_clear))
-    app.add_handler(CommandHandler("done", cmd_done))
-    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("import", cmd_import))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("newcount", cmd_newcount))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
     log.info("Bot started")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
